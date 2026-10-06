@@ -8,6 +8,8 @@ import type { Pond } from '../types/pond';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { MeteringTicket } from '../types/metering';
+import { brineMassT } from './metering';
 import { effectiveVerdict, pondVolumeM3, round1 } from './brine';
 import { stampSuffix } from './id';
 
@@ -71,11 +73,20 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
+  // v3 新增计量单：v2 存档没有该数组时按空数组处理，导入后由 v3 升级逻辑等价补齐
+  const snapshot = data as DatabaseSnapshot;
+  if (!Array.isArray(snapshot.meteringTickets)) snapshot.meteringTickets = [];
+  return { ok: true, message: '存档校验通过。', snapshot };
 }
 
-/** 生成晒程进度汇总 CSV */
-export function buildProgressCsv(ponds: Pond[], observations: Observation[], assays: Assay[], schedules: Schedule[]): string {
+/** 生成晒程进度汇总 CSV（含外送计量对账列） */
+export function buildProgressCsv(
+  ponds: Pond[],
+  observations: Observation[],
+  assays: Assay[],
+  schedules: Schedule[],
+  meteringTickets: MeteringTicket[] = [],
+): string {
   const header = [
     '池号',
     '池系',
@@ -92,6 +103,9 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
     '最近判定',
     '走水计划数',
     '已完成出卤数',
+    '待核实计量单',
+    '有效计量累计体积(m³)',
+    '有效计量累计质量(t)',
   ];
   const lines: string[] = [header.map(csvCell).join(',')];
   ponds.forEach((pond) => {
@@ -100,6 +114,12 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
     const pondAssays = assays.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
     const latestAssay = pondAssays.length > 0 ? pondAssays[pondAssays.length - 1] : null;
     const pondSchedules = schedules.filter((row) => row.pondId === pond.id);
+    // 按池号聚合计量单：历史补号单在池号对得上现存池时也归并进来
+    const pondTickets = meteringTickets.filter((ticket) => ticket.pondId === pond.id || ticket.pondCode === pond.code);
+    const validTickets = pondTickets.filter((ticket) => ticket.status === '有效');
+    const sumVolume = validTickets.reduce((acc, ticket) => acc + ticket.volumeM3, 0);
+    const sumMass = validTickets.reduce((acc, ticket) => acc + brineMassT(ticket.densityGcm3, ticket.volumeM3), 0);
+    const unmatchedCount = pondTickets.filter((ticket) => ticket.legacyFlag === 'unmatched').length;
     lines.push(
       [
         pond.code,
@@ -117,6 +137,9 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
         latestAssay === null ? '—' : effectiveVerdict(latestAssay),
         pondSchedules.length,
         pondSchedules.filter((row) => row.state === '已出卤').length,
+        unmatchedCount,
+        Math.round(sumVolume * 10) / 10,
+        Math.round(sumMass * 10) / 10,
       ]
         .map(csvCell)
         .join(','),
@@ -131,9 +154,67 @@ export function exportProgressCsvFile(
   observations: Observation[],
   assays: Assay[],
   schedules: Schedule[],
+  meteringTickets: MeteringTicket[] = [],
 ): string {
   const filename = `盐湖晒程进度汇总-${stampSuffix()}.csv`;
-  download(filename, buildProgressCsv(ponds, observations, assays, schedules), 'text/csv;charset=utf-8');
+  download(filename, buildProgressCsv(ponds, observations, assays, schedules, meteringTickets), 'text/csv;charset=utf-8');
+  return filename;
+}
+
+/** 外送计量台账 CSV 表头 */
+const METERING_CSV_HEADER = [
+  '交接批次号',
+  '池号',
+  '计量日期',
+  '计量次数',
+  '体积(m³)',
+  '密度(g/cm³)',
+  '质量(t)',
+  '已收货',
+  '状态',
+  '单据性质',
+  '已对出卤单',
+  '旧数据标记',
+  '备注',
+];
+
+/** 生成外送计量台账 CSV：作废单保留、复测链可追溯 */
+export function buildMeteringCsv(tickets: MeteringTicket[], schedules: Schedule[]): string {
+  const scheduleById = new Map(schedules.map((row) => [row.id, row]));
+  const lines: string[] = [METERING_CSV_HEADER.map(csvCell).join(',')];
+  [...tickets]
+    .sort((a, b) => a.batchNo.localeCompare(b.batchNo) || a.measureRound - b.measureRound)
+    .forEach((ticket) => {
+      const linked = ticket.matchedScheduleId !== '' ? scheduleById.get(ticket.matchedScheduleId) : undefined;
+      const nature =
+        ticket.status === '作废' ? '已作废（复测替代）' : ticket.measureRound > 1 ? `复测第${ticket.measureRound}次` : '首测';
+      lines.push(
+        [
+          ticket.batchNo,
+          ticket.pondCode,
+          ticket.measureDate,
+          ticket.measureRound,
+          ticket.volumeM3,
+          ticket.densityGcm3,
+          brineMassT(ticket.densityGcm3, ticket.volumeM3),
+          ticket.received ? '是' : '否',
+          ticket.status,
+          nature,
+          linked === undefined ? '—' : `${linked.planDate}/${linked.volumeM3}m³`,
+          ticket.legacyFlag === 'unmatched' ? '待核实' : ticket.legacyFlag === 'backfilled' ? '升级补号' : '',
+          ticket.note,
+        ]
+          .map(csvCell)
+          .join(','),
+      );
+    });
+  return `﻿${lines.join('\n')}`;
+}
+
+/** 导出外送计量台账 CSV */
+export function exportMeteringCsvFile(tickets: MeteringTicket[], schedules: Schedule[]): string {
+  const filename = `外送计量台账-${stampSuffix()}.csv`;
+  download(filename, buildMeteringCsv(tickets, schedules), 'text/csv;charset=utf-8');
   return filename;
 }
 
@@ -150,8 +231,14 @@ export async function copyText(text: string): Promise<boolean> {
   return false;
 }
 
-/** 生成晒程调度通报纯文本 */
-export function buildBriefingText(ponds: Pond[], observations: Observation[], assays: Assay[], schedules: Schedule[]): string {
+/** 生成晒程调度通报纯文本（含外送计量对账摘要） */
+export function buildBriefingText(
+  ponds: Pond[],
+  observations: Observation[],
+  assays: Assay[],
+  schedules: Schedule[],
+  meteringTickets: MeteringTicket[] = [],
+): string {
   const lines: string[] = [`【盐湖晒程调度通报】共 ${ponds.length} 口蒸发池`];
   ponds.forEach((pond) => {
     const pondObs = observations.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
@@ -167,5 +254,17 @@ export function buildBriefingText(ponds: Pond[], observations: Observation[], as
       }，待完成走水 ${pending} 条`,
     );
   });
+  if (meteringTickets.length > 0) {
+    const valid = meteringTickets.filter((ticket) => ticket.status === '有效');
+    const waiting = valid.filter((ticket) => !ticket.received).length;
+    const voided = meteringTickets.filter((ticket) => ticket.status === '作废').length;
+    const unmatched = meteringTickets.filter((ticket) => ticket.legacyFlag === 'unmatched').length;
+    const pendingReconcile = schedules.filter(
+      (row) => row.state === '走水中' || (row.state === '待排' && row.batchNo !== null && row.batchNo !== ''),
+    ).length;
+    lines.push(
+      `【外送计量】计量单 ${meteringTickets.length} 张（有效 ${valid.length} / 作废 ${voided}），待收货 ${waiting} 张，待对账出卤单 ${pendingReconcile} 张，待核实旧数据 ${unmatched} 张`,
+    );
+  }
   return lines.join('\n');
 }

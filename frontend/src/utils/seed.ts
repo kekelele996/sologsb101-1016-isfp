@@ -1,7 +1,8 @@
 /**
  * 演示数据播种（幂等）
- * 父 → 子 → 孙三层链路：蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排
- * 所有 id 固定，保证 /gates、/observations、/assays、/schedules 打开就有真实串级与数据。
+ * 父 → 子 → 孙三层链路：蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 →
+ * 走水编排（出卤单）→ 外送计量单
+ * 所有 id 固定，保证 /gates、/observations、/assays、/schedules、/metering 打开就有真实串级与数据。
  */
 import { db, ROW_REVISION } from './db';
 import type { Pond } from '../types/pond';
@@ -9,9 +10,11 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { MeteringTicket } from '../types/metering';
 import { autoVerdict, estimateEvapMm } from './brine';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
+const SEED_TIME_LATE = '2026-10-06T01:30:00.000Z';
 
 /** 固定 id，便于文档与深链验证 */
 export const SEED_IDS = {
@@ -74,6 +77,14 @@ function assay(
   });
 }
 
+/** 生成外送计量单 */
+function ticket(
+  id: string,
+  fields: Omit<MeteringTicket, 'id' | 'createdAt' | 'updatedAt' | 'revision'>,
+): MeteringTicket {
+  return { id, createdAt: SEED_TIME_LATE, updatedAt: SEED_TIME_LATE, revision: ROW_REVISION, ...fields };
+}
+
 export async function seedDatabase(): Promise<void> {
   const exists = await db.ponds.count();
   if (exists > 0) return;
@@ -128,20 +139,73 @@ export async function seedDatabase(): Promise<void> {
     }),
   ];
 
-  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
+  // ---------------- 走水编排（出卤单，orderIndex 决定先后；含交接批次） ----------------
   const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1, batchNo: null, dischargeDensity: null, meteringTicketId: null }),
+    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2, batchNo: null, dischargeDensity: null, meteringTicketId: null }),
+    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3, batchNo: null, dischargeDensity: null, meteringTicketId: null }),
+    // 复测退回待排：原计量单已作废，目标密度已按复测新密度重算，批次号保留待重新对账
+    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.249, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4, batchNo: 'JL-20260930-北-03-01', dischargeDensity: null, meteringTicketId: 'ticket-c1-old' }),
+    // 旧数据补号：已出卤历史单，v3 升级按池号+日期补录计量单
+    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5, batchNo: 'B-20260928-南-05', dischargeDensity: 1.15, meteringTicketId: 'ticket-e1' }),
   ];
 
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    await db.ponds.bulkPut(ponds);
-    await db.gates.bulkPut(gates);
-    await db.observations.bulkPut(observations);
-    await db.assays.bulkPut(assays);
-    await db.schedules.bulkPut(schedules);
-  });
+  // ---------------- 外送计量单（计量站按交接批次出具） ----------------
+  const meteringTickets: MeteringTicket[] = [
+    // 待对账：北-02 走水中，批次未指配，已收货、密度对得上
+    ticket('ticket-b1', {
+      batchNo: 'JL-20261005-北-02-01', pondCode: '北-02', pondId: SEED_IDS.pondB, measureDate: '2026-10-05',
+      volumeM3: 900, densityGcm3: 1.175, received: true, measureRound: 1, status: '有效', supersededById: '',
+      originId: 'ticket-b1', matchedScheduleId: '', legacyFlag: '', note: '外送计量站当班出具',
+    }),
+    // 同池另一批次：密度对不上（超出 ±0.002 容差），用于演示对账拦截
+    ticket('ticket-b2', {
+      batchNo: 'JL-20261006-北-02-02', pondCode: '北-02', pondId: SEED_IDS.pondB, measureDate: '2026-10-06',
+      volumeM3: 900, densityGcm3: 1.19, received: true, measureRound: 1, status: '有效', supersededById: '',
+      originId: 'ticket-b2', matchedScheduleId: '', legacyFlag: '', note: '密度与出卤单差异超容差',
+    }),
+    // 计量站尚未收货：不能对账
+    ticket('ticket-d1', {
+      batchNo: 'JL-20261003-南-04-01', pondCode: '南-04', pondId: SEED_IDS.pondD, measureDate: '2026-10-03',
+      volumeM3: 1600, densityGcm3: 1.098, received: false, measureRound: 1, status: '有效', supersededById: '',
+      originId: 'ticket-d1', matchedScheduleId: '', legacyFlag: '', note: '槽车尚未到站',
+    }),
+    // 复测链 · 首次计量：复测后密度一变，本单作废，两次计量都保留
+    ticket('ticket-c1-old', {
+      batchNo: 'JL-20260930-北-03-01', pondCode: '北-03', pondId: SEED_IDS.pondC, measureDate: '2026-09-30',
+      volumeM3: 600, densityGcm3: 1.248, received: true, measureRound: 1, status: '作废', supersededById: 'ticket-c1-new',
+      originId: 'ticket-c1-old', matchedScheduleId: 'schedule-c1', legacyFlag: '', note: '复测密度变化，本单作废',
+    }),
+    // 复测链 · 复测单：批次号沿用，次数 2，等出卤单重新对账
+    ticket('ticket-c1-new', {
+      batchNo: 'JL-20260930-北-03-01', pondCode: '北-03', pondId: SEED_IDS.pondC, measureDate: '2026-10-03',
+      volumeM3: 600, densityGcm3: 1.249, received: true, measureRound: 2, status: '有效', supersededById: '',
+      originId: 'ticket-c1-old', matchedScheduleId: '', legacyFlag: '', note: '复测计量单，出卤单已按新密度重算',
+    }),
+    // 旧数据补号（对得上）：v3 升级按池号+日期补录
+    ticket('ticket-e1', {
+      batchNo: 'B-20260928-南-05', pondCode: '南-05', pondId: SEED_IDS.pondE, measureDate: '2026-09-28',
+      volumeM3: 700, densityGcm3: 1.15, received: true, measureRound: 1, status: '有效', supersededById: '',
+      originId: 'ticket-e1', matchedScheduleId: 'schedule-e1', legacyFlag: 'backfilled', note: 'v3 升级按池号+日期补录的历史计量单',
+    }),
+    // 旧数据对不上现存蒸发池：单列待核实
+    ticket('ticket-legacy-orphan', {
+      batchNo: 'B-20260915-西-09', pondCode: '西-09', pondId: '', measureDate: '2026-09-15',
+      volumeM3: 500, densityGcm3: 1.13, received: true, measureRound: 1, status: '有效', supersededById: '',
+      originId: 'ticket-legacy-orphan', matchedScheduleId: '', legacyFlag: 'unmatched', note: '池号在现存台账中查不到，待人工核实',
+    }),
+  ];
+
+  await db.transaction(
+    'rw',
+    [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.meteringTickets],
+    async () => {
+      await db.ponds.bulkPut(ponds);
+      await db.gates.bulkPut(gates);
+      await db.observations.bulkPut(observations);
+      await db.assays.bulkPut(assays);
+      await db.schedules.bulkPut(schedules);
+      await db.meteringTickets.bulkPut(meteringTickets);
+    },
+  );
 }

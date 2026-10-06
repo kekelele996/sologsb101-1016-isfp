@@ -4,6 +4,7 @@
  * 消费模型：Schedule、Gate、Assay；复用组件：<FilterBar>、<EmptyPanel>、<StatBadge>
  */
 import { For, Show, createMemo, createSignal, onMount } from 'solid-js';
+import { A } from '@solidjs/router';
 import { createStore } from 'solid-js/store';
 import AppDialog from '../components/common/AppDialog';
 import EmptyPanel from '../components/common/EmptyPanel';
@@ -40,6 +41,7 @@ function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
     operator: '',
     state: '待排',
     orderIndex,
+    batchNo: null,
   };
 }
 
@@ -113,6 +115,7 @@ export default function ScheduleBoard() {
       operator: row.operator,
       state: row.state,
       orderIndex: row.orderIndex,
+      batchNo: row.batchNo,
     });
     setDialogOpen(true);
   };
@@ -237,6 +240,15 @@ export default function ScheduleBoard() {
                     <p class="text-xs text-slate-500">
                       计划日期 {row.planDate} · 调度员 {row.operator === '' ? '未填写' : row.operator}
                     </p>
+                    <p class="mt-0.5 text-[11px] text-slate-500">
+                      交接批次：
+                      <Show when={row.batchNo !== null && row.batchNo !== ''} fallback={<span class="text-slate-400">未指配</span>}>
+                        <span class="font-medium text-brine-700">{row.batchNo}</span>
+                      </Show>
+                      <Show when={row.dischargeDensity !== null}>
+                        <span class="ml-2 text-slate-400">对账密度 {row.dischargeDensity}</span>
+                      </Show>
+                    </p>
                   </div>
                   <div class="flex items-center gap-2">
                     <StageTag stage={pondOf(row.pondId)?.stage ?? null} size="sm" />
@@ -270,16 +282,28 @@ export default function ScheduleBoard() {
                   </div>
                   <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
                   <div class="flex flex-wrap items-center gap-2">
-                    <button
-                      class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"
-                      disabled={row.state === '已出卤'}
-                      onClick={async () => {
-                        const next = await scheduleStore.advance(row.id);
-                        if (next === null) scheduleStore.setMessage('该计划已处于「已出卤」状态');
-                      }}
+                    <Show
+                      when={row.state === '走水中'}
+                      fallback={
+                        <button
+                          class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"
+                          disabled={row.state === '已出卤'}
+                          onClick={async () => {
+                            const next = await scheduleStore.advance(row.id);
+                            if (next === null) scheduleStore.setMessage('该计划已处于最终状态');
+                          }}
+                        >
+                          {nextStateLabel(row.state)}
+                        </button>
+                      }
                     >
-                      {nextStateLabel(row.state)}
-                    </button>
+                      <A
+                        href={`/metering?schedule=${encodeURIComponent(row.id)}`}
+                        class="rounded-md border border-brine-500 bg-brine-600 px-2.5 py-1 text-xs font-medium text-white transition hover:bg-brine-700"
+                      >
+                        对账出卤 →
+                      </A>
+                    </Show>
                     <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
                       编辑
                     </button>
@@ -377,9 +401,18 @@ export default function ScheduleBoard() {
               onInput={(event) => setDraft('orderIndex', Number(event.currentTarget.value))}
             />
           </label>
+          <label class="flex flex-col gap-1 text-[13px] text-slate-600 sm:col-span-2">
+            <span>交接批次号（与计量站外送计量单对账；留空则对账时按计量单指配）</span>
+            <input
+              class={INPUT}
+              value={draft.batchNo ?? ''}
+              placeholder="如 JL-20261006-北-02-01；复测退回的出卤单保留原批次"
+              onInput={(event) => setDraft('batchNo', event.currentTarget.value.trim() === '' ? null : event.currentTarget.value.trim())}
+            />
+          </label>
         </div>
         <p class="mt-3 rounded-md bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-500">
-          状态推进到「已出卤」时，会把该池推进到下一蒸发阶段，并把最新一次观测的密度回写为当前实际密度。
+          出卤单推进到「走水中」后，须到「外送计量对账」页按池号 + 交接批次对账：计量站已收货、密度对得上才推到「已出卤」，同时回写池阶段与实际密度。复测密度变化时计量单作废、本单退回待排按新密度重算。
         </p>
       </AppDialog>
 

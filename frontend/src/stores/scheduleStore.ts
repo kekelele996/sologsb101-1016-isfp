@@ -14,9 +14,9 @@ import {
   putSchedule,
   removeSchedule,
   reorderSchedules,
+  ROW_REVISION,
 } from '../utils/db';
 import { nowIso, uuid } from '../utils/id';
-import { usePondStore } from './pondStore';
 
 /** 走水编排筛选条件 */
 export interface ScheduleFilters {
@@ -84,9 +84,12 @@ function createScheduleStore() {
       operator: draft.operator.trim(),
       state: draft.state,
       orderIndex: draft.orderIndex,
+      batchNo: draft.batchNo === null || draft.batchNo.trim() === '' ? null : draft.batchNo.trim(),
+      dischargeDensity: null,
+      meteringTicketId: null,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
     await putSchedule(row);
     setState('lastMessage', `已新建走水计划：${row.planDate}`);
@@ -105,6 +108,7 @@ function createScheduleStore() {
       operator: draft.operator.trim(),
       state: draft.state,
       orderIndex: draft.orderIndex,
+      batchNo: draft.batchNo === null || draft.batchNo.trim() === '' ? null : draft.batchNo.trim(),
     });
     setState('lastMessage', '走水计划已更新');
   }
@@ -120,17 +124,14 @@ function createScheduleStore() {
     const index = SCHEDULE_STATE_FLOW.indexOf(existing.state);
     if (index < 0 || index >= SCHEDULE_STATE_FLOW.length - 1) return null;
     const next = SCHEDULE_STATE_FLOW[index + 1];
-    const pondStore = usePondStore();
-    const stat = pondStore.statOf(existing.pondId);
-    const actualDensity = stat.currentDensity > 0 ? stat.currentDensity : existing.targetDensity;
-    await advanceScheduleState(scheduleId, next, actualDensity);
-    await pondStore.refreshCounts();
-    setState(
-      'lastMessage',
-      next === '已出卤'
-        ? `已出卤：池阶段已推进，实际密度回写为 ${actualDensity} g/cm³`
-        : `状态已推进为「${next}」`,
-    );
+    // 「走水中 → 已出卤」必须凭计量站有效计量单在 /metering 完成池号+批次对账，
+    // 不允许在编排台直接推进。
+    if (next === '已出卤') {
+      setState('lastMessage', '外送出卤须先到「外送计量对账」按池号 + 交接批次对账通过');
+      return null;
+    }
+    await advanceScheduleState(scheduleId, next);
+    setState('lastMessage', `状态已推进为「${next}」`);
     return next;
   }
 
