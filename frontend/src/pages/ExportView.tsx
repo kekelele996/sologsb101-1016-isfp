@@ -29,15 +29,24 @@ export default function ExportView() {
     const observations = store.state.observations;
     const assays = store.state.assays;
     const schedules = store.state.schedules;
+    const tickets = store.state.meteringTickets;
+    const discharges = store.state.dischargeOrders;
     const passCount = assays.filter((row) => effectiveVerdict(row) === '达标').length;
     const done = schedules.filter((row) => row.state === '已出卤').length;
     const readyPonds = new Set(assays.filter((row) => effectiveVerdict(row) === '达标').map((row) => row.pondId)).size;
+    const discharged = discharges.filter((row) => row.state === '已出卤').length;
+    const blocked = discharges.filter((row) => row.state === '待排' && (row.reconcileVerdict === 'noTicket' || row.reconcileVerdict === 'density')).length;
     return {
       ponds: ponds.length,
       observations: observations.length,
       assays: assays.length,
       gates: store.state.gates.length,
       schedules: schedules.length,
+      tickets: tickets.length,
+      voidTickets: tickets.filter((row) => row.status === '已作废').length,
+      discharges: discharges.length,
+      discharged,
+      blocked,
       passCount,
       passPct: assays.length === 0 ? 0 : Math.round((passCount / assays.length) * 1000) / 10,
       donePct: schedules.length === 0 ? 0 : Math.round((done / schedules.length) * 1000) / 10,
@@ -108,12 +117,15 @@ export default function ExportView() {
         />
         <StatBadge label="出卤候选池" value={summary().readyPonds} suffix="口" tone="success" />
         <StatBadge label="出卤完成率" value={`${summary().donePct}%`} percent={summary().donePct} tone="primary" />
+        <StatBadge label="外送计量单" value={summary().tickets} suffix="张" tone="info" hint={`作废留痕 ${summary().voidTickets} 张：复测密度变化后原单作废，两次计量都保留`} />
+        <StatBadge label="已对账出卤" value={summary().discharged} suffix="张" tone="success" hint="计量站收货且密度对得上，已推到「已出卤」" />
+        <StatBadge label="对账拦截" value={summary().blocked} suffix="张" tone="danger" hint="缺有效计量单或密度不符，出卤单保持「待排」" />
         <StatBadge
           label="数据结构版本"
           value={`v${DB_SCHEMA_VERSION}`}
           suffix={`· ${DB_NAME}`}
           tone="default"
-          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录"
+          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm，v3 新增计量单/出卤单并为旧出卤数据补交接批次号"
         />
       </div>
 
@@ -231,7 +243,7 @@ export default function ExportView() {
           <div class="w-full max-w-lg rounded-xl bg-white shadow-2xl">
             <div class="border-b border-slate-200 px-4 py-3 text-sm font-semibold text-slate-800">确认重置本地数据？</div>
             <div class="px-4 py-4 text-sm leading-relaxed text-slate-600">
-              全部蒸发池、闸门串级、卤水日观测、离子组分分析与走水编排都会被清空，并重新灌入演示数据。
+              全部蒸发池、闸门串级、卤水日观测、离子组分分析、走水编排与计量交接凭证（外送计量单、出卤单）都会被清空，并重新灌入演示数据。
             </div>
             <div class="flex justify-end gap-2 border-t border-slate-200 px-4 py-3">
               <button class={BTN_GHOST} onClick={() => setResetOpen(false)}>

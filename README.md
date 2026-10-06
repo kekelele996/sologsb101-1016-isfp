@@ -41,7 +41,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 路由 | @solidjs/router 0.15 | `Router root={App}` 布局路由，全部路径支持深链刷新 |
 | 状态管理 | Solid 原生能力 | `createStore`（pondStore / scheduleStore）+ `createSignal`（observationStore），**不使用 Pinia / Zustand** |
 | UI | Tailwind CSS 3.4 | 全部界面手写 Tailwind，**不使用 Element Plus / Ant Design / Vue / React** |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v1 → v2` 新增 `evapMm` 并迁移旧记录 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v1 → v2` 新增 `evapMm`，`v2 → v3` 新增计量单 / 出卤单并为旧出卤数据补交接批次号 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -69,13 +69,14 @@ sologsb101-1016/
         ├── index.tsx           # 入口：render + 初始化数据库
         ├── App.tsx             # 外壳：品牌栏 + 侧边导航 + 内容区（Router root 布局）
         ├── styles/main.css     # @tailwind 指令 + 全局样式
-        ├── types/              # pond.ts gate.ts observation.ts assay.ts schedule.ts
-        ├── stores/             # pondStore.ts observationStore.ts scheduleStore.ts
+        ├── types/              # pond.ts gate.ts observation.ts assay.ts schedule.ts discharge.ts metering.ts
+        ├── stores/             # pondStore.ts observationStore.ts scheduleStore.ts dischargeStore.ts meteringStore.ts
         ├── components/common/  # StageTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx AppDialog.tsx
+        ├── components/metering/ # DischargeList.tsx TicketList.tsx
         ├── hooks/              # useEvaporation.ts useIdbTable.ts
-        ├── pages/              # 6 个模块页面
+        ├── pages/              # 7 个模块页面
         ├── router/index.tsx    # AppRouter + ROUTES 常量 + NAV_ITEMS
-        └── utils/              # brine.ts db.ts export.ts seed.ts id.ts
+        └── utils/              # brine.ts metering.ts db.ts export.ts seed.ts id.ts
 ```
 
 ---
@@ -89,6 +90,7 @@ sologsb101-1016/
 | `/observations` | `pages/ObservationEntry.tsx` | 卤水日观测录入台：单条 + 批量粘贴录入，同池同日覆盖写入，蒸发量按经验公式自动估算 |
 | `/assays` | `pages/AssayEntry.tsx` | 离子组分分析：Li⁺/K⁺/Mg²⁺/Na⁺ 录入、自动达标判定（可人工覆盖）、SVG 组分曲线 |
 | `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按日期排序、HTML5 拖拽调整先后顺序、逐条推进状态、出卤回写池阶段 |
+| `/metering` | `pages/MeteringBoard.tsx` | 计量站交接对账台：计量站按交接批次出外送计量单（批次号/体积/密度）、复测作废留痕；调度端出卤单按「池号+交接批次」对账，收货且密度对得上才推「已出卤」，复测作废后退回「待排」重算 |
 | `/export` | `pages/ExportView.tsx` | 晒程进度汇总、JSON 结构版本查看与导入导出、CSV 汇总、重置演示数据 |
 
 `/` 重定向到 `/ponds`，未匹配路径统一回落到 `/ponds`。
@@ -101,11 +103,15 @@ sologsb101-1016/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbbrinepond`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 **`pondId+date` 复合索引**（`observations`、`assays`）；
   * `db.version(2)`：**新增 `evapMm` 字段**并写入真实升级迁移逻辑 ——
     `.upgrade()` 里对 `observations` 逐行检查，缺失或非法时按密度/温度/水位/风力用经验公式回填默认值；
     同时补齐 `revision` / `createdAt` / `updatedAt`、`assays.verdictManual`、`schedules.orderIndex`。
+  * `db.version(3)`：**新增计量站交接域两表 `meteringTickets` / `dischargeOrders`**（含
+    **`pondId+handoverBatch` 复合索引**）；旧数据没登记交接批次号，升级时按 **池号 + 日期补号**
+    （格式 `BN-{池号}-{YYYYMMDD}`），为历史「已出卤」走水计划补出卤单与对应的有效初测计量单；
+    **对不上的（池已删除）单列**：`migrationIssue` 非空、退回「待排」、不造计量单，在对账台高亮核对。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -115,6 +121,8 @@ sologsb101-1016/
   | `observations` | id | pondId, date, **[pondId+date]**, densityGcm3, evapMm |
   | `assays` | id | pondId, date, **[pondId+date]**, verdict, verdictManual |
   | `schedules` | id | pondId, planDate, state, orderIndex |
+  | `meteringTickets` | id | handoverBatch, pondId, measureDate, status, round, **[pondId+handoverBatch]** |
+  | `dischargeOrders` | id | pondId, planDate, handoverBatch, state, **[pondId+handoverBatch]** |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `ponds` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排** 三层互相引用：
@@ -123,9 +131,11 @@ sologsb101-1016/
   * 16 条卤水日观测（每池 2–4 条，密度随日期递增，`evapMm` 由经验公式生成）；
   * 6 条离子组分分析（覆盖达标 / 接近 / 未达标，其中 1 条为人工覆盖判定）；
   * 5 条走水编排（覆盖待排 / 已排 / 走水中 / 已出卤四种状态）。
+  * 4 张外送计量单与 4 张出卤单：覆盖「对账通过可出卤 / 缺计量单拦截 / 密度不符拦截 /
+    复测作废后退回待排重算（初测单 + 复测单两次留痕）」。
   * 固定 id 如 `pond-north-01`、`pond-south-04` 可直接用于验证与二次开发。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的池系」这一界面偏好，不存业务数据。
-* 删除蒸发池会**级联清理**相关闸门（上下游任一为该池）、观测、化验与走水编排（同一 Dexie 事务内完成）。
+* 删除蒸发池会**级联清理**相关闸门（上下游任一为该池）、观测、化验、走水计划与计量交接凭证（同一 Dexie 事务内完成）。
 
 ---
 
@@ -157,3 +167,22 @@ npm run preview      # 预览 dist 产物
   判定达标的池自动进入**出卤候选**；人工覆盖只改写判定标注，原始化验数值保持不变。
 * **闸门过流估算**：`1.7 × 过流面积 × √水头 × 开度`，用于开度调整后的下游进水量即时反馈；开度变化会同步推导闸门状态（关闭 / 半开 / 全开）。
 * **出卤回写**：走水状态推进到「已出卤」时，蒸发池阶段自动推进（钠盐→钾盐→锂盐），并把最新一次观测的密度回写为实际密度。
+
+## 八、计量站交接规则（`src/utils/metering.ts`，页面 `/metering`）
+
+盐田外送卤水要过计量站，调度端与计量站两侧各执一账，按**池号 + 交接批次号**对账：
+
+* **外送计量单（计量站）**：按交接批次出具，写清批次号、实收体积与计量密度（25 ℃ 折算口径）；
+  同池号 + 同批次只允许一张**有效**计量单。
+* **出卤单（调度端）**：登记池号、计划外送日期、交接批次、外送体积与密度；
+  **结算质量（t）= 体积（m³）× 密度（g/cm³）**。
+* **对账放行**：排下一批出卤时按池号和交接批次核对 —— 计量站收了货（存在有效计量单）、
+  且 `|计量密度 − 出卤密度| ≤ 0.005 g/cm³` 密度对得上，出卤单才推到「已出卤」，并回写蒸发池阶段；
+  缺计量单或密度不符都不放行，出卤单保持「待排」并标注拦截原因。支持「排下一批前批量预检」。
+* **复测作废**：对有效计量单录入复测，复测后密度一变（超出容差）——
+  原计量单置为「已作废」但**行保留（两次计量都留着）**，出具一张「复测」新单指向原单；
+  用过原单的出卤单**退回「待排」、清空对账结果、按新密度重算结算质量**，与复测单重新对账通过后再次出卤。
+  复测密度在容差内则原单继续有效。
+* **升级补号（v2 → v3）**：旧数据没登记交接批次号，升级时为历史「已出卤」走水计划按
+  **池号 + 日期补号**（`BN-{池号}-{YYYYMMDD}`），同步补一张「有效」初测计量单视同已收货；
+  池号对不上（池已删除）的记录**单列**：高亮提示 `migrationIssue`、退回「待排」待人工核对。

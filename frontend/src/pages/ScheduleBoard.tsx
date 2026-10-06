@@ -5,6 +5,7 @@
  */
 import { For, Show, createMemo, createSignal, onMount } from 'solid-js';
 import { createStore } from 'solid-js/store';
+import { A } from '@solidjs/router';
 import AppDialog from '../components/common/AppDialog';
 import EmptyPanel from '../components/common/EmptyPanel';
 import FilterBar from '../components/common/FilterBar';
@@ -173,9 +174,14 @@ export default function ScheduleBoard() {
       <section class="rounded-xl border border-slate-200 bg-white p-4">
         <header class="mb-3 flex flex-wrap items-center justify-between gap-2">
           <h2 class="text-[15px] font-semibold text-slate-800">走水与出卤编排</h2>
-          <button type="button" class={BTN_PRIMARY} onClick={openCreate} disabled={pondStore.state.ponds.length === 0}>
-            + 新建走水计划
-          </button>
+          <div class="flex items-center gap-3">
+            <A href="/metering" class="text-xs text-brine-700 hover:underline">
+              外送计量交接对账 →
+            </A>
+            <button type="button" class={BTN_PRIMARY} onClick={openCreate} disabled={pondStore.state.ponds.length === 0}>
+              + 新建走水计划
+            </button>
+          </div>
         </header>
 
         <FilterBar

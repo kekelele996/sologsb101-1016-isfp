@@ -10,6 +10,8 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { DischargeOrder } from '../types/discharge';
+import type { MeteringTicket } from '../types/metering';
 import { DB_SCHEMA_VERSION, ROW_REVISION, countAll, db, initDatabase, putPond, removePond } from '../utils/db';
 import { effectiveVerdict, pondVolumeM3 } from '../utils/brine';
 import { nowIso, uuid } from '../utils/id';
@@ -45,6 +47,8 @@ interface PondState {
   observations: Observation[];
   assays: Assay[];
   schedules: Schedule[];
+  meteringTickets: MeteringTicket[];
+  dischargeOrders: DischargeOrder[];
   currentSeries: string | null;
   loading: boolean;
   ready: boolean;
@@ -78,6 +82,8 @@ function createPondStore() {
     observations: [],
     assays: [],
     schedules: [],
+    meteringTickets: [],
+    dischargeOrders: [],
     currentSeries: readSeries(),
     loading: true,
     ready: false,
@@ -100,16 +106,18 @@ function createPondStore() {
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [ponds, gates, observations, assays, schedules] = await Promise.all([
+          const [ponds, gates, observations, assays, schedules, meteringTickets, dischargeOrders] = await Promise.all([
             db.ponds.toArray(),
             db.gates.toArray(),
             db.observations.toArray(),
             db.assays.toArray(),
             db.schedules.toArray(),
+            db.meteringTickets.toArray(),
+            db.dischargeOrders.toArray(),
           ]);
-          return { ponds, gates, observations, assays, schedules };
+          return { ponds, gates, observations, assays, schedules, meteringTickets, dischargeOrders };
         }).subscribe({
-          next: ({ ponds, gates, observations, assays, schedules }) => {
+          next: ({ ponds, gates, observations, assays, schedules, meteringTickets, dischargeOrders }) => {
             const sorted = [...ponds].sort(
               (a, b) => a.seriesName.localeCompare(b.seriesName, 'zh-Hans-CN') || a.code.localeCompare(b.code),
             );
@@ -119,6 +127,8 @@ function createPondStore() {
               observations: [...observations].sort((a, b) => a.date.localeCompare(b.date)),
               assays: [...assays].sort((a, b) => a.date.localeCompare(b.date)),
               schedules: [...schedules].sort((a, b) => a.orderIndex - b.orderIndex),
+              meteringTickets,
+              dischargeOrders,
               loading: false,
               ready: true,
               error: '',

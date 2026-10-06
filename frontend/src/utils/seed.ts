@@ -9,6 +9,9 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { DischargeOrder } from '../types/discharge';
+import type { MeteringTicket } from '../types/metering';
+import { handoverMassTonnes } from './metering';
 import { autoVerdict, estimateEvapMm } from './brine';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
@@ -137,11 +140,147 @@ export async function seedDatabase(): Promise<void> {
     wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
   ];
 
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    await db.ponds.bulkPut(ponds);
-    await db.gates.bulkPut(gates);
-    await db.observations.bulkPut(observations);
-    await db.assays.bulkPut(assays);
-    await db.schedules.bulkPut(schedules);
-  });
+  // ---------------- 计量站外送计量单（按交接批次；初测 + 复测两次都留痕） ----------------
+  const meteringTickets: MeteringTicket[] = [
+    wrap<MeteringTicket>({
+      id: 'ticket-c1-1',
+      handoverBatch: 'JJ-20261012-C3',
+      pondId: SEED_IDS.pondC,
+      measureDate: '2026-10-12',
+      volumeM3: 600,
+      densityGcm3: 1.258,
+      round: '初测',
+      status: '有效',
+      voidReason: '',
+      supersedesTicketId: null,
+      backfilledBatch: false,
+    }),
+    // 批次 JJ-20260928-E5：复测密度变化 → 初测单作废、复测单有效（两次计量都留着）
+    wrap<MeteringTicket>({
+      id: 'ticket-e1-1',
+      handoverBatch: 'JJ-20260928-E5',
+      pondId: SEED_IDS.pondE,
+      measureDate: '2026-09-28',
+      volumeM3: 700,
+      densityGcm3: 1.15,
+      round: '初测',
+      status: '已作废',
+      voidReason: '复测密度变化：1.15 → 1.157（2026-09-30）',
+      supersedesTicketId: null,
+      backfilledBatch: false,
+    }),
+    wrap<MeteringTicket>({
+      id: 'ticket-e1-2',
+      handoverBatch: 'JJ-20260928-E5',
+      pondId: SEED_IDS.pondE,
+      measureDate: '2026-09-30',
+      volumeM3: 700,
+      densityGcm3: 1.157,
+      round: '复测',
+      status: '有效',
+      voidReason: '',
+      supersedesTicketId: 'ticket-e1-1',
+      backfilledBatch: false,
+    }),
+    // 批次 JJ-20261002-A1：计量密度 1.126 与出卤单 1.115 对不上
+    wrap<MeteringTicket>({
+      id: 'ticket-a1-1',
+      handoverBatch: 'JJ-20261002-A1',
+      pondId: SEED_IDS.pondA,
+      measureDate: '2026-10-02',
+      volumeM3: 1200,
+      densityGcm3: 1.126,
+      round: '初测',
+      status: '有效',
+      voidReason: '',
+      supersedesTicketId: null,
+      backfilledBatch: false,
+    }),
+  ];
+
+  // ---------------- 出卤单（调度端；覆盖对账通过 / 缺计量单 / 密度不符 / 复测退回） ----------------
+  const dischargeOrders: DischargeOrder[] = [
+    // 计量站已收货、密度对得上：可直接对账推送「已出卤」
+    wrap<DischargeOrder>({
+      id: 'discharge-c1',
+      pondId: SEED_IDS.pondC,
+      planDate: '2026-10-12',
+      handoverBatch: 'JJ-20261012-C3',
+      volumeM3: 600,
+      densityGcm3: 1.255,
+      massTonnes: handoverMassTonnes(600, 1.255),
+      operator: '李文',
+      state: '待排',
+      reconcileVerdict: 'matched',
+      meteringTicketId: 'ticket-c1-1',
+      revisedAfterVoid: false,
+      migratedFromSchedule: false,
+      migrationIssue: '',
+    }),
+    // 计量站还没登记本批次：对账拦截（缺计量单）
+    wrap<DischargeOrder>({
+      id: 'discharge-b1',
+      pondId: SEED_IDS.pondB,
+      planDate: '2026-10-06',
+      handoverBatch: 'JJ-20261006-B2',
+      volumeM3: 900,
+      densityGcm3: 1.175,
+      massTonnes: handoverMassTonnes(900, 1.175),
+      operator: '韩江',
+      state: '待排',
+      reconcileVerdict: 'noTicket',
+      meteringTicketId: null,
+      revisedAfterVoid: false,
+      migratedFromSchedule: false,
+      migrationIssue: '',
+    }),
+    // 批次 JJ-20261002-A1：密度对不上（出卤 1.115 vs 计量 1.126）→ 拦截
+    wrap<DischargeOrder>({
+      id: 'discharge-a1',
+      pondId: SEED_IDS.pondA,
+      planDate: '2026-10-02',
+      handoverBatch: 'JJ-20261002-A1',
+      volumeM3: 1200,
+      densityGcm3: 1.115,
+      massTonnes: handoverMassTonnes(1200, 1.115),
+      operator: '韩江',
+      state: '待排',
+      reconcileVerdict: 'density',
+      meteringTicketId: null,
+      revisedAfterVoid: false,
+      migratedFromSchedule: false,
+      migrationIssue: '',
+    }),
+    // 复测后密度变化：已出卤被退回「待排」，按新密度 1.157 重算，等待与复测单重新对账
+    wrap<DischargeOrder>({
+      id: 'discharge-e1',
+      pondId: SEED_IDS.pondE,
+      planDate: '2026-09-28',
+      handoverBatch: 'JJ-20260928-E5',
+      volumeM3: 700,
+      densityGcm3: 1.157,
+      massTonnes: handoverMassTonnes(700, 1.157),
+      operator: '王锐',
+      state: '待排',
+      reconcileVerdict: 'matched',
+      meteringTicketId: null,
+      revisedAfterVoid: true,
+      migratedFromSchedule: false,
+      migrationIssue: '',
+    }),
+  ];
+
+  await db.transaction(
+    'rw',
+    [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.meteringTickets, db.dischargeOrders],
+    async () => {
+      await db.ponds.bulkPut(ponds);
+      await db.gates.bulkPut(gates);
+      await db.observations.bulkPut(observations);
+      await db.assays.bulkPut(assays);
+      await db.schedules.bulkPut(schedules);
+      await db.meteringTickets.bulkPut(meteringTickets);
+      await db.dischargeOrders.bulkPut(dischargeOrders);
+    },
+  );
 }
